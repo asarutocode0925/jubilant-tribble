@@ -1,0 +1,133 @@
+import asyncio
+import multiprocessing
+import sys
+import aiohttp
+
+# ---------------------------------------------------------
+# 設定項目
+# ---------------------------------------------------------
+USER_TOKEN = "YOUR_USER_TOKEN_HERE"  # ユーザートークン
+CHANNEL_ID = "TARGET_CHANNEL_ID_HERE"  # チャンネルID
+NUM_PROCESSES = 4  # プロセス数
+CONCURRENCY_PER_PROCESS = 15  # 1プロセスあたりの同時実行タスク数
+
+URL = f"https://discord.com/api/v9/channels/{CHANNEL_ID}/invites"
+HEADERS = {
+    "Authorization": USER_TOKEN,
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0",
+}
+PAYLOAD = {"max_age": 0, "max_uses": 0, "temporary": False, "unique": True}
+
+
+async def async_worker(session, semaphore, queue):
+    while True:
+        async with semaphore:
+            try:
+                async with session.post(
+                    URL, headers=HEADERS, json=PAYLOAD
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        code = data.get("code")
+                        if code:
+                            queue.put(f"https://discord.gg/{code}\n")
+                    elif resp.status == 429:
+                        try:
+                            data = await resp.json()
+                            retry_after = float(data.get("retry_after", 1.0))
+                        except Exception:
+                            retry_after = 2.0
+                        await asyncio.sleep(retry_after)
+                    elif resp.status in (401, 403):
+                        queue.put(
+                            "[!] 認証エラーまたは権限不足です。トークンやチャンネルIDを確認してください。\n"
+                        )
+                        await asyncio.sleep(10.0)
+                    else:
+                        await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
+
+
+def process_main(queue):
+    """各プロセス内のエントリポイント"""
+
+    async def main_loop():
+        connector = aiohttp.TCPConnector(
+            limit=50, limit_per_host=25, keepalive_timeout=30, force_close=False
+        )
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+
+        async with aiohttp.ClientSession(
+            connector=connector, timeout=timeout
+        ) as session:
+            semaphore = asyncio.Semaphore(CONCURRENCY_PER_PROCESS)
+            tasks = [
+                asyncio.create_task(
+                    async_worker(session, semaphore, queue)
+                )
+                for _ in range(CONCURRENCY_PER_PROCESS)
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        pass
+
+
+def listener_process(queue):
+    """複数プロセスからの出力を安全に集約・表示するリスナー"""
+    while True:
+        message = queue.get()
+        if message is None:
+            break
+        sys.stdout.write(message)
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
+    manager = multiprocessing.Manager()
+    output_queue = manager.Queue()
+
+    # 出力専用リスナープロセスの起動（競合・文字化け防止）
+    listener = multiprocessing.Process(
+        target=listener_process, args=(output_queue,)
+    )
+    listener.start()
+
+    print(
+        f"🐛 バグ修正・安定化版エンジン起動 (プロセス数: {NUM_PROCESSES})"
+    )
+
+    workers = []
+    for _ in range(NUM_PROCESSES):
+        p = multiprocessing.Process(target=process_main, args=(output_queue,))
+        p.start()
+        workers.append(p)
+
+    try:
+        for p in workers:
+            p.join()
+    except KeyboardInterrupt:
+        print("\n👋 終了シグナルを受信しました。クリーンアップ中...")
+        for p in workers:
+            p.terminate()
+        for p in workers:
+            p.join()
+
+        output_queue.put(None)
+        listener.join()
+        print("✨ すべてのプロセスが正常に停止しました。")
+
+[agehan AI] discord.gg/agehan :agehan AI:
